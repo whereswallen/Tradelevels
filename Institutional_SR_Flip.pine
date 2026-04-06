@@ -1,0 +1,498 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © Institutional SR Flip Indicator
+//@version=5
+indicator("Institutional S/R Flip", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+string GRP_STRUCT  = "Multi-Timeframe Structure"
+int    pivotLen    = input.int(5,     "Pivot Lookback Length",    minval=2,  group=GRP_STRUCT)
+bool   show1H      = input.bool(true, "Show 1H Levels",          group=GRP_STRUCT)
+bool   show4H      = input.bool(true, "Show 4H Levels",          group=GRP_STRUCT)
+bool   showDaily   = input.bool(true, "Show Daily Levels",       group=GRP_STRUCT)
+
+string GRP_BENCH   = "Institutional Benchmarks"
+bool   showPWHL    = input.bool(true, "Show Prev Week High/Low", group=GRP_BENCH)
+bool   showPDOC    = input.bool(true, "Show Prev Day Open/Close",group=GRP_BENCH)
+
+string GRP_PSYCH   = "Psychology Numbers"
+bool   showPsych   = input.bool(true, "Show Psychology Numbers",  group=GRP_PSYCH)
+float  psychStep   = input.float(100, "Round Number Step Size",   minval=1, group=GRP_PSYCH)
+int    psychCount  = input.int(5,     "Levels Above/Below Price", minval=1, maxval=20, group=GRP_PSYCH)
+
+string GRP_FILT    = "Confluence & Cleaning"
+float  proxPct     = input.float(0.15,"Proximity Filter %",      minval=0.01, step=0.01, group=GRP_FILT)
+float  confPct     = input.float(0.30,"Confluence Zone Width %",  minval=0.05, step=0.05, group=GRP_FILT)
+int    confMinLvls = input.int(3,     "Min Levels for Confluence",minval=2,  group=GRP_FILT)
+
+string GRP_FLIP    = "Break & Retest (Flip) Logic"
+int    atrLen      = input.int(14,    "ATR Length",               minval=1,  group=GRP_FLIP)
+float  atrMult     = input.float(0.5, "ATR Retest Multiplier",   minval=0.1,step=0.1, group=GRP_FLIP)
+int    volLen      = input.int(20,    "Volume MA Length",         minval=1,  group=GRP_FLIP)
+
+string GRP_VIS     = "Visuals"
+int    maxLevels   = input.int(50,    "Max Tracked Levels",       minval=10, maxval=200, group=GRP_VIS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LEVEL UDT
+// ─────────────────────────────────────────────────────────────────────────────
+type Level
+    float price
+    string tf           // "1H","4H","D","PWH","PWL","PDO","PDC","PSYCH"
+    string kind         // "pivot_high","pivot_low","benchmark","psych"
+    int    priority      // higher = keep in proximity filter (D=5, 4H=4, 1H=3, bench=2, psych=1)
+    bool   isBroken  = false
+    bool   breakIsUp = false   // true = price broke upward (was support, now resistance flip expected)
+    float  breakVol  = 0.0
+    int    breakBar  = 0
+    bool   isRetested = false
+    bool   isActive  = true
+    bool   isConfluence = false
+    bool   isHiddenByProx = false
+    int    createdBar = 0
+    line   ln = na
+    label  lb = na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var array<Level> levels = array.new<Level>()
+var array<box>   confBoxes = array.new<box>()
+
+float atrVal  = ta.atr(atrLen)
+float volMA   = ta.sma(volume, volLen)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+f_getPriority(string tf) =>
+    switch tf
+        "D"    => 5
+        "4H"   => 4
+        "1H"   => 3
+        "PWH"  => 2
+        "PWL"  => 2
+        "PDO"  => 2
+        "PDC"  => 2
+        => 1  // PSYCH
+
+f_getColor(string tf) =>
+    switch tf
+        "D"    => color.new(color.blue, 0)
+        "4H"   => color.new(color.orange, 0)
+        "1H"   => color.new(color.gray, 0)
+        "PWH"  => color.new(color.purple, 0)
+        "PWL"  => color.new(color.purple, 0)
+        "PDO"  => color.new(color.green, 0)
+        "PDC"  => color.new(color.green, 0)
+        => color.new(color.silver, 0)  // PSYCH
+
+f_getStyle(string tf) =>
+    switch tf
+        "D"    => line.style_solid
+        "4H"   => line.style_dashed
+        "PWH"  => line.style_dashed
+        "PWL"  => line.style_dashed
+        "PDO"  => line.style_dashed
+        "PDC"  => line.style_dashed
+        => line.style_dotted  // 1H, PSYCH
+
+f_getWidth(string tf) =>
+    switch tf
+        "D"    => 2
+        "PWH"  => 2
+        "PWL"  => 2
+        "PDO"  => 2
+        "PDC"  => 2
+        => 1
+
+f_labelText(Level lvl) =>
+    string brk = lvl.isBroken ? (lvl.isRetested ? " ✓FLIP" : " ⚡BRK") : ""
+    lvl.tf + " " + str.tostring(lvl.price, format.mintick) + brk
+
+// Check if a level with approximately the same price and tf already exists
+f_levelExists(float price, string tf) =>
+    bool found = false
+    for i = 0 to array.size(levels) - 1
+        Level existing = array.get(levels, i)
+        if existing.tf == tf and math.abs(existing.price - price) < syminfo.mintick * 2
+            found := true
+            break
+    found
+
+// Add a new level to the array
+f_addLevel(float price, string tf, string kind) =>
+    if not na(price) and not f_levelExists(price, tf)
+        Level lvl = Level.new()
+        lvl.price      := price
+        lvl.tf         := tf
+        lvl.kind       := kind
+        lvl.priority   := f_getPriority(tf)
+        lvl.createdBar := bar_index
+        array.push(levels, lvl)
+
+// Clean up excess levels (remove oldest inactive or retested)
+f_trimLevels() =>
+    if array.size(levels) > maxLevels
+        // Remove retested levels first
+        int i = 0
+        while i < array.size(levels) and array.size(levels) > maxLevels
+            Level lvl = array.get(levels, i)
+            if lvl.isRetested
+                if not na(lvl.ln)
+                    line.delete(lvl.ln)
+                if not na(lvl.lb)
+                    label.delete(lvl.lb)
+                array.remove(levels, i)
+            else
+                i += 1
+        // Then remove oldest levels
+        while array.size(levels) > maxLevels
+            Level oldest = array.get(levels, 0)
+            if not na(oldest.ln)
+                line.delete(oldest.ln)
+            if not na(oldest.lb)
+                label.delete(oldest.lb)
+            array.remove(levels, 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE A: LEVEL DETECTION — Multi-Timeframe Pivots (Non-Repainting)
+// ─────────────────────────────────────────────────────────────────────────────
+// Compute pivots on the current chart, then request from HTFs
+f_pivHi() => ta.pivothigh(high, pivotLen, pivotLen)
+f_pivLo() => ta.pivotlow(low, pivotLen, pivotLen)
+
+// 1H pivots
+float ph1H = request.security(syminfo.tickerid, "60",  f_pivHi()[1], barmerge.gaps_on, barmerge.lookahead_on)
+float pl1H = request.security(syminfo.tickerid, "60",  f_pivLo()[1], barmerge.gaps_on, barmerge.lookahead_on)
+
+// 4H pivots
+float ph4H = request.security(syminfo.tickerid, "240", f_pivHi()[1], barmerge.gaps_on, barmerge.lookahead_on)
+float pl4H = request.security(syminfo.tickerid, "240", f_pivLo()[1], barmerge.gaps_on, barmerge.lookahead_on)
+
+// Daily pivots
+float phD  = request.security(syminfo.tickerid, "D",   f_pivHi()[1], barmerge.gaps_on, barmerge.lookahead_on)
+float plD  = request.security(syminfo.tickerid, "D",   f_pivLo()[1], barmerge.gaps_on, barmerge.lookahead_on)
+
+// Add new pivots when they appear (not na and different from previous)
+if show1H and not na(ph1H)
+    f_addLevel(ph1H, "1H", "pivot_high")
+if show1H and not na(pl1H)
+    f_addLevel(pl1H, "1H", "pivot_low")
+if show4H and not na(ph4H)
+    f_addLevel(ph4H, "4H", "pivot_high")
+if show4H and not na(pl4H)
+    f_addLevel(pl4H, "4H", "pivot_low")
+if showDaily and not na(phD)
+    f_addLevel(phD, "D", "pivot_high")
+if showDaily and not na(plD)
+    f_addLevel(plD, "D", "pivot_low")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE A: Institutional Benchmarks (Non-Repainting)
+// ─────────────────────────────────────────────────────────────────────────────
+// Previous Week High/Low
+float weekHi = request.security(syminfo.tickerid, "W", high[1], barmerge.gaps_on, barmerge.lookahead_on)
+float weekLo = request.security(syminfo.tickerid, "W", low[1],  barmerge.gaps_on, barmerge.lookahead_on)
+
+// Previous Day Open/Close
+float dayOpen  = request.security(syminfo.tickerid, "D", open[1],  barmerge.gaps_on, barmerge.lookahead_on)
+float dayClose = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_on, barmerge.lookahead_on)
+
+// Only add benchmarks once per new session
+var float _prevPWH = na
+var float _prevPWL = na
+var float _prevPDO = na
+var float _prevPDC = na
+
+if showPWHL and not na(weekHi) and weekHi != _prevPWH
+    // Remove old PWH level
+    for i = array.size(levels) - 1 to 0
+        Level lvl = array.get(levels, i)
+        if lvl.tf == "PWH" and not lvl.isBroken
+            if not na(lvl.ln)
+                line.delete(lvl.ln)
+            if not na(lvl.lb)
+                label.delete(lvl.lb)
+            array.remove(levels, i)
+            break
+    f_addLevel(weekHi, "PWH", "benchmark")
+    _prevPWH := weekHi
+
+if showPWHL and not na(weekLo) and weekLo != _prevPWL
+    for i = array.size(levels) - 1 to 0
+        Level lvl = array.get(levels, i)
+        if lvl.tf == "PWL" and not lvl.isBroken
+            if not na(lvl.ln)
+                line.delete(lvl.ln)
+            if not na(lvl.lb)
+                label.delete(lvl.lb)
+            array.remove(levels, i)
+            break
+    f_addLevel(weekLo, "PWL", "benchmark")
+    _prevPWL := weekLo
+
+if showPDOC and not na(dayOpen) and dayOpen != _prevPDO
+    for i = array.size(levels) - 1 to 0
+        Level lvl = array.get(levels, i)
+        if lvl.tf == "PDO" and not lvl.isBroken
+            if not na(lvl.ln)
+                line.delete(lvl.ln)
+            if not na(lvl.lb)
+                label.delete(lvl.lb)
+            array.remove(levels, i)
+            break
+    f_addLevel(dayOpen, "PDO", "benchmark")
+    _prevPDO := dayOpen
+
+if showPDOC and not na(dayClose) and dayClose != _prevPDC
+    for i = array.size(levels) - 1 to 0
+        Level lvl = array.get(levels, i)
+        if lvl.tf == "PDC" and not lvl.isBroken
+            if not na(lvl.ln)
+                line.delete(lvl.ln)
+            if not na(lvl.lb)
+                label.delete(lvl.lb)
+            array.remove(levels, i)
+            break
+    f_addLevel(dayClose, "PDC", "benchmark")
+    _prevPDC := dayClose
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE A: Psychology Numbers
+// ─────────────────────────────────────────────────────────────────────────────
+if showPsych and barstate.islast
+    // Remove old psych levels
+    for i = array.size(levels) - 1 to 0
+        Level lvl = array.get(levels, i)
+        if lvl.tf == "PSYCH"
+            if not na(lvl.ln)
+                line.delete(lvl.ln)
+            if not na(lvl.lb)
+                label.delete(lvl.lb)
+            array.remove(levels, i)
+    // Add new psych levels around current price
+    float baseLevel = math.floor(close / psychStep) * psychStep
+    for j = -psychCount to psychCount
+        float pLevel = baseLevel + j * psychStep
+        if pLevel > 0
+            f_addLevel(pLevel, "PSYCH", "psych")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trim excess levels
+// ─────────────────────────────────────────────────────────────────────────────
+f_trimLevels()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE B: PROXIMITY FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+// Reset hidden state
+for i = 0 to array.size(levels) - 1
+    Level lvl = array.get(levels, i)
+    lvl.isHiddenByProx := false
+    lvl.isConfluence   := false
+
+// Sort levels by price using simple bubble sort (array sizes are small)
+for i = 0 to array.size(levels) - 2
+    for j = 0 to array.size(levels) - i - 2
+        Level a = array.get(levels, j)
+        Level b = array.get(levels, j + 1)
+        if a.price > b.price
+            array.set(levels, j, b)
+            array.set(levels, j + 1, a)
+
+// Apply proximity filter: hide lower-priority level when two are close
+for i = 0 to array.size(levels) - 2
+    Level a = array.get(levels, i)
+    Level b = array.get(levels, i + 1)
+    if a.isHiddenByProx
+        continue
+    float dist = math.abs(a.price - b.price)
+    float threshold = a.price * proxPct / 100.0
+    if dist < threshold and dist > 0
+        // Hide the one with lower priority
+        if a.priority <= b.priority
+            a.isHiddenByProx := true
+        else
+            b.isHiddenByProx := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE B: CONFLUENCE ZONE DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+// Delete old confluence boxes
+for i = array.size(confBoxes) - 1 to 0
+    box.delete(array.get(confBoxes, i))
+array.clear(confBoxes)
+
+// Scan for clusters: sliding window on sorted levels
+if array.size(levels) >= confMinLvls
+    int clusterStart = 0
+    while clusterStart <= array.size(levels) - confMinLvls
+        Level startLvl = array.get(levels, clusterStart)
+        if startLvl.isHiddenByProx
+            clusterStart += 1
+            continue
+        float rangeThreshold = startLvl.price * confPct / 100.0
+        int clusterEnd = clusterStart
+        int visibleCount = 1
+        // Extend cluster window
+        for k = clusterStart + 1 to array.size(levels) - 1
+            Level candidate = array.get(levels, k)
+            if candidate.isHiddenByProx
+                continue
+            if math.abs(candidate.price - startLvl.price) <= rangeThreshold
+                clusterEnd := k
+                visibleCount += 1
+            else
+                break
+        if visibleCount >= confMinLvls
+            // Mark all levels in cluster as confluence
+            float minP = array.get(levels, clusterStart).price
+            float maxP = array.get(levels, clusterEnd).price
+            for k = clusterStart to clusterEnd
+                Level lvl = array.get(levels, k)
+                if not lvl.isHiddenByProx
+                    lvl.isConfluence := true
+            // Draw confluence box
+            box confBox = box.new(
+              bar_index - 20, maxP,
+              bar_index + 20, minP,
+              border_color=color.new(color.orange, 50),
+              bgcolor=color.new(#FFD700, 85),
+              border_width=1,
+              text="CONFLUENCE ZONE",
+              text_color=color.new(#FFD700, 20),
+              text_size=size.small,
+              text_halign=text.align_center,
+              text_valign=text.align_center)
+            array.push(confBoxes, confBox)
+            clusterStart := clusterEnd + 1
+        else
+            clusterStart += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE C: BREAK & RETEST STATE MACHINE
+// ─────────────────────────────────────────────────────────────────────────────
+var bool masterAlert = false
+masterAlert := false
+
+for i = 0 to array.size(levels) - 1
+    Level lvl = array.get(levels, i)
+    if not lvl.isActive or lvl.isHiddenByProx
+        continue
+
+    float price = lvl.price
+    float bufferZone = atrVal * atrMult
+
+    // ── Check for BREAK (body close past level with volume) ──
+    if not lvl.isBroken
+        bool brokeUp   = close > price and close[1] <= price   // body closed above
+        bool brokeDown = close < price and close[1] >= price   // body closed below
+        bool highVol   = volume > volMA
+
+        if brokeUp and highVol
+            lvl.isBroken  := true
+            lvl.breakIsUp := true
+            lvl.breakVol  := volume
+            lvl.breakBar  := bar_index
+
+        if brokeDown and highVol
+            lvl.isBroken  := true
+            lvl.breakIsUp := false
+            lvl.breakVol  := volume
+            lvl.breakBar  := bar_index
+
+    // ── Check for RETEST (first test only) ──
+    else if lvl.isBroken and not lvl.isRetested and bar_index > lvl.breakBar
+        bool inZone = math.abs(close - price) <= bufferZone
+        bool lowVol = volume < lvl.breakVol
+
+        if lvl.breakIsUp
+            // Broke upward → expect pullback DOWN to level (now support)
+            bool pullback = low <= price + bufferZone and close >= price - bufferZone
+            if pullback and inZone and lowVol
+                lvl.isRetested := true
+                // Draw flip signal — bullish
+                label.new(bar_index, low - atrVal * 0.3,
+                  "▲ SR FLIP\n" + lvl.tf + " " + str.tostring(price, format.mintick),
+                  style=label.style_label_up,
+                  color=color.new(color.green, 0),
+                  textcolor=color.white,
+                  size=size.small)
+                if lvl.isConfluence
+                    masterAlert := true
+        else
+            // Broke downward → expect pullback UP to level (now resistance)
+            bool pullback = high >= price - bufferZone and close <= price + bufferZone
+            if pullback and inZone and lowVol
+                lvl.isRetested := true
+                // Draw flip signal — bearish
+                label.new(bar_index, high + atrVal * 0.3,
+                  "▼ SR FLIP\n" + lvl.tf + " " + str.tostring(price, format.mintick),
+                  style=label.style_label_down,
+                  color=color.new(color.red, 0),
+                  textcolor=color.white,
+                  size=size.small)
+                if lvl.isConfluence
+                    masterAlert := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE D: DRAWING MANAGEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+for i = 0 to array.size(levels) - 1
+    Level lvl = array.get(levels, i)
+
+    // Skip hidden levels — delete their drawings
+    if lvl.isHiddenByProx or not lvl.isActive
+        if not na(lvl.ln)
+            line.delete(lvl.ln)
+            lvl.ln := na
+        if not na(lvl.lb)
+            label.delete(lvl.lb)
+            lvl.lb := na
+        continue
+
+    color  lineCol   = f_getColor(lvl.tf)
+    string lineStyle = f_getStyle(lvl.tf)
+    int    lineWidth = f_getWidth(lvl.tf)
+
+    // Broken levels get a different color
+    if lvl.isBroken and not lvl.isRetested
+        lineCol := color.new(color.yellow, 30)
+    if lvl.isRetested
+        lineCol := color.new(color.gray, 60)
+
+    // Confluence levels get gold tint
+    if lvl.isConfluence and not lvl.isBroken
+        lineCol := color.new(#FFD700, 0)
+
+    // Create or update line
+    if na(lvl.ln)
+        lvl.ln := line.new(bar_index - 50, lvl.price, bar_index + 20, lvl.price,
+          color=lineCol, style=lineStyle, width=lineWidth, extend=extend.right)
+    else
+        line.set_xy1(lvl.ln, bar_index - 50, lvl.price)
+        line.set_xy2(lvl.ln, bar_index + 20, lvl.price)
+        line.set_color(lvl.ln, lineCol)
+        line.set_style(lvl.ln, lineStyle)
+        line.set_width(lvl.ln, lineWidth)
+
+    // Create or update label (far right)
+    string lblTxt = f_labelText(lvl)
+    if na(lvl.lb)
+        lvl.lb := label.new(bar_index + 25, lvl.price, lblTxt,
+          style=label.style_none,
+          textcolor=lineCol,
+          size=size.tiny)
+    else
+        label.set_xy(lvl.lb, bar_index + 25, lvl.price)
+        label.set_text(lvl.lb, lblTxt)
+        label.set_textcolor(lvl.lb, lineCol)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE E: ALERT
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(masterAlert,
+  title="SR Flip in Confluence Zone",
+  message="🔔 First Test S/R Flip confirmed at a Major Confluence Zone!")
