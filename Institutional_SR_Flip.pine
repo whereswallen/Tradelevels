@@ -36,21 +36,21 @@ int maxLevels = input.int(50, "Max Tracked Levels", minval=10, maxval=200, group
 // LEVEL UDT
 // =============================================================================
 type Level
-    float  price
-    string tf
-    string kind
-    int    priority = 0
-    bool   isBroken = false
-    bool   breakIsUp = false
-    float  breakVol = 0.0
-    int    breakBar = 0
-    bool   isRetested = false
-    bool   isActive = true
-    bool   isConfluence = false
-    bool   isHiddenByProx = false
-    int    createdBar = 0
-    line   ln
-    label  lb
+	float price
+	string tf
+	string kind
+	int priority = 0
+	bool isBroken = false
+	bool breakIsUp = false
+	float breakVol = 0.0
+	int breakBar = 0
+	bool isRetested = false
+	bool isActive = true
+	bool isConfluence = false
+	bool isHiddenByProx = false
+	int createdBar = 0
+	line ln
+	label lb
 
 // =============================================================================
 // GLOBAL STATE
