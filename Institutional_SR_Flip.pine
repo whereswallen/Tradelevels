@@ -36,9 +36,9 @@ int maxLevels = input.int(50, "Max Tracked Levels", minval=10, maxval=200, group
 // LEVEL UDT
 // =============================================================================
 type Level
-    float  price = na
-    string tf = na
-    string kind = na
+    float  price
+    string tf
+    string kind
     int    priority = 0
     bool   isBroken = false
     bool   breakIsUp = false
@@ -49,8 +49,8 @@ type Level
     bool   isConfluence = false
     bool   isHiddenByProx = false
     int    createdBar = 0
-    line   ln = na
-    label  lb = na
+    line   ln
+    label  lb
 
 // =============================================================================
 // GLOBAL STATE
